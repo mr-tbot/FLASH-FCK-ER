@@ -14,7 +14,10 @@
 #   3. Speed benchmarks — 10s each instead of 30s, seq read + write only
 #   4. Verdict — compares real vs claimed capacity & speed
 # =============================================================================
-set -euo pipefail
+set -uo pipefail
+# NOTE: we intentionally do NOT use 'set -e' because individual tool
+# failures (f3probe crash, fio error, etc.) must be caught and handled
+# gracefully so the script can continue to subsequent phases and verdict.
 
 # Colors
 RED='\033[0;31m'
@@ -24,7 +27,8 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-RESULTS_DIR="/home/mr-tbot/CODE/Storage-Check/results"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RESULTS_DIR="${SCRIPT_DIR}/results"
 QUICK_RUNTIME=10  # seconds per fio test
 
 # ---------------------------------------------------------------------------

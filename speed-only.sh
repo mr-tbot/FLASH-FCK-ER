@@ -6,7 +6,8 @@
 #
 # Usage: sudo ./speed-only.sh /dev/sdX "Description" "claimed_speed"
 # =============================================================================
-set -euo pipefail
+set -uo pipefail
+# NOTE: no 'set -e' so individual tool failures don't abort the script.
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -25,7 +26,8 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-RESULTS_DIR="/home/mr-tbot/CODE/Storage-Check/results"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RESULTS_DIR="${SCRIPT_DIR}/results"
 mkdir -p "$RESULTS_DIR"
 
 DEVICE="$1"

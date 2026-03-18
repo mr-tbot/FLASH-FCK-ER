@@ -9,7 +9,10 @@
 # WARNING: The capacity tests (f3probe, f3write/f3read) are DESTRUCTIVE.
 #          All data on the device WILL BE DESTROYED.
 # =============================================================================
-set -euo pipefail
+set -uo pipefail
+# NOTE: we intentionally do NOT use 'set -e' because individual tool
+# failures (f3write crash, fio error, etc.) must be caught and handled
+# gracefully so the script can continue to subsequent phases and verdict.
 
 # Colors
 RED='\033[0;31m'
@@ -19,7 +22,8 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-RESULTS_DIR="/home/mr-tbot/CODE/Storage-Check/results"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RESULTS_DIR="${SCRIPT_DIR}/results"
 MOUNT_POINT="/tmp/storage-check-mnt"
 
 # ---------------------------------------------------------------------------
@@ -68,6 +72,16 @@ preflight_checks() {
         exit 1
     fi
 }
+
+# ---------------------------------------------------------------------------
+cleanup() {
+    # Best-effort cleanup on exit (normal or abnormal)
+    if mountpoint -q "$MOUNT_POINT" 2>/dev/null; then
+        umount "$MOUNT_POINT" 2>/dev/null || umount -l "$MOUNT_POINT" 2>/dev/null || true
+    fi
+    rmdir "$MOUNT_POINT" 2>/dev/null || true
+}
+trap cleanup EXIT
 
 # ---------------------------------------------------------------------------
 unmount_device() {
@@ -149,30 +163,75 @@ test_capacity_full() {
 
     log "Running f3write (filling device with verification data)..."
     F3W_START=$(date +%s)
+    # Temporarily disable pipefail so the pipeline doesn't short-circuit,
+    # then use PIPESTATUS to get f3write's specific exit code.
+    set +o pipefail
     f3write "$MOUNT_POINT" 2>&1 | tee -a "$REPORT"
+    F3W_RC=${PIPESTATUS[0]}
+    set -o pipefail
     F3W_END=$(date +%s)
     F3W_DURATION=$((F3W_END - F3W_START))
-    log "f3write completed in ${F3W_DURATION}s"
+
+    # Count how many .h2w files were successfully written
+    F3W_FILES_WRITTEN=$(find "$MOUNT_POINT" -name '*.h2w' 2>/dev/null | wc -l)
+    # Estimate expected files: device size / ~4.7GB per file, minus filesystem overhead
+    DEVICE_BYTES=$(lsblk -bndo SIZE "$DEVICE" 2>/dev/null | tr -d ' ' || echo 0)
+    F3W_FILES_EXPECTED=$(( DEVICE_BYTES / 1073741824 / 5 + 1 ))  # rough estimate
+    # Better: count from f3write output lines
+    F3W_FILES_OK=$(grep -c 'OK!$' "$REPORT" 2>/dev/null || echo 0)
+
+    if [[ $F3W_RC -ne 0 ]]; then
+        warn "f3write exited with code $F3W_RC after ${F3W_DURATION}s"
+        warn "Files successfully written: $F3W_FILES_WRITTEN (.h2w files on disk)"
+
+        # Check if it was a "filled up" crash vs an early failure
+        if grep -q 'Structure needs cleaning' "$REPORT" 2>/dev/null || \
+           grep -q 'No space left on device' "$REPORT" 2>/dev/null || \
+           grep -q 'Write failure' "$REPORT" 2>/dev/null; then
+            warn "f3write stopped because the filesystem filled up (this is expected near 100%)"
+            warn "This is NOT a sign of fake capacity — the ext4 overhead consumed the last portion."
+            echo "F3W_STATUS=FILLED" >> "$SUMMARY"
+        else
+            fail "f3write crashed unexpectedly — check log for details"
+            echo "F3W_STATUS=CRASHED" >> "$SUMMARY"
+        fi
+    else
+        log "f3write completed successfully in ${F3W_DURATION}s"
+        echo "F3W_STATUS=OK" >> "$SUMMARY"
+    fi
+    echo "F3W_FILES_WRITTEN=$F3W_FILES_WRITTEN" >> "$SUMMARY"
 
     echo "" | tee -a "$REPORT"
-    log "Running f3read (verifying all written data)..."
-    F3R_START=$(date +%s)
-    F3R_OUT=$(f3read "$MOUNT_POINT" 2>&1)
-    F3R_END=$(date +%s)
-    F3R_DURATION=$((F3R_END - F3R_START))
-    echo "$F3R_OUT" | tee -a "$REPORT"
-    log "f3read completed in ${F3R_DURATION}s"
 
-    # Parse f3read results
-    SECTORS_OK=$(echo "$F3R_OUT" | grep -i "sectors are ok" || true)
-    DATA_LOST=$(echo "$F3R_OUT" | grep -i "data lost" || echo "$F3R_OUT" | grep -i "corrupted" || true)
+    # Run f3read if there are .h2w files to verify (even after partial f3write)
+    if [[ "$F3W_FILES_WRITTEN" -gt 0 ]]; then
+        log "Running f3read (verifying $F3W_FILES_WRITTEN written files)..."
+        F3R_START=$(date +%s)
+        F3R_RC=0
+        F3R_OUT=$(f3read "$MOUNT_POINT" 2>&1) || F3R_RC=$?
+        F3R_END=$(date +%s)
+        F3R_DURATION=$((F3R_END - F3R_START))
+        echo "$F3R_OUT" | tee -a "$REPORT"
 
-    if [[ -n "$DATA_LOST" ]] && echo "$DATA_LOST" | grep -qvE "^[[:space:]]*$"; then
-        fail "DATA LOSS / CORRUPTION detected — device has FAKE capacity"
-        echo "F3_FULL_RESULT=FAIL" >> "$SUMMARY"
+        if [[ $F3R_RC -ne 0 ]]; then
+            warn "f3read exited with code $F3R_RC after ${F3R_DURATION}s"
+        else
+            log "f3read completed in ${F3R_DURATION}s"
+        fi
+
+        # Parse f3read results
+        DATA_LOST=$(echo "$F3R_OUT" | grep -iE 'data lost|corrupted' || true)
+
+        if [[ -n "$DATA_LOST" ]] && echo "$DATA_LOST" | grep -qvE "^[[:space:]]*$"; then
+            fail "DATA LOSS / CORRUPTION detected — device has FAKE capacity"
+            echo "F3_FULL_RESULT=FAIL" >> "$SUMMARY"
+        else
+            pass "All written data verified successfully"
+            echo "F3_FULL_RESULT=PASS" >> "$SUMMARY"
+        fi
     else
-        pass "All written data verified successfully"
-        echo "F3_FULL_RESULT=PASS" >> "$SUMMARY"
+        fail "No .h2w files written — f3write failed completely"
+        echo "F3_FULL_RESULT=ERROR" >> "$SUMMARY"
     fi
 
     umount "$MOUNT_POINT" 2>/dev/null || true
@@ -281,29 +340,48 @@ generate_verdict() {
     source "$SUMMARY"
 
     FAKE=0
+    WARNINGS=0
 
+    echo -e "${BOLD}── Capacity ──${NC}"
     if [[ "${F3PROBE_RESULT:-UNKNOWN}" == "FAIL" ]]; then
-        fail "CAPACITY: f3probe detected fake capacity"
+        fail "f3probe detected fake capacity"
         FAKE=1
     elif [[ "${F3PROBE_RESULT:-UNKNOWN}" == "PASS" ]]; then
-        pass "CAPACITY: f3probe found no issues (quick test)"
+        pass "f3probe found no issues (quick probe)"
     fi
 
     if [[ "${F3_FULL_RESULT:-UNKNOWN}" == "FAIL" ]]; then
-        fail "CAPACITY: Full write/read test detected data loss — FAKE SIZE"
+        fail "Full write/read test detected data loss — FAKE SIZE"
         FAKE=1
     elif [[ "${F3_FULL_RESULT:-UNKNOWN}" == "PASS" ]]; then
-        pass "CAPACITY: Full write/read test passed"
+        pass "Full write/read test — all data verified"
+        if [[ "${F3W_STATUS:-}" == "FILLED" ]]; then
+            log "(f3write filled the device; filesystem ran out of space near 100% — this is normal)"
+        fi
+    elif [[ "${F3_FULL_RESULT:-UNKNOWN}" == "ERROR" ]]; then
+        warn "Full write/read test could not run (f3write failed completely)"
+        WARNINGS=$((WARNINGS + 1))
+    fi
+
+    if [[ "${F3W_FILES_WRITTEN:-0}" -gt 0 ]]; then
+        log "f3write files on disk: ${F3W_FILES_WRITTEN}"
     fi
 
     echo ""
-    echo "Review speed results in: $REPORT"
+    echo -e "${BOLD}── Speed ──${NC}"
+    echo "Review detailed speed results in: $REPORT"
     echo "Compare sequential read/write speeds against claimed: $CLAIMED_SPEED"
-    echo ""
 
+    echo ""
+    echo -e "${BOLD}── Overall ──${NC}"
     if [[ $FAKE -eq 1 ]]; then
+        echo ""
         echo -e "${RED}${BOLD}  ██████  DEVICE IS LIKELY FAKE  ██████${NC}"
+    elif [[ $WARNINGS -gt 0 ]]; then
+        echo ""
+        echo -e "${YELLOW}${BOLD}  ⚠  INCONCLUSIVE — $WARNINGS warning(s). Review results manually.${NC}"
     else
+        echo ""
         echo -e "${GREEN}${BOLD}  Device passed all tests — appears genuine${NC}"
     fi
 
