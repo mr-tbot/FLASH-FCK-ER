@@ -270,4 +270,25 @@ All results are saved to `results/` with timestamped filenames:
 
 ## License
 
+[MIT](LICENSE) — Copyright (c) 2026 Talbot "TBOT" Simons (mr-tbot) / BOT-HOLDINGS, LLC
+
 Do whatever you want with it. Fakes deserve no mercy.
+
+FLASH-FCK-ER is original bash. It does not bundle, vendor, or redistribute any
+third-party code — it invokes `f3`, `fio`, `hdparm`, `smartctl`, `bc`, `lsblk`
+and `mkfs.ext4` as separate programs that you install from your own package
+manager. Each keeps its own license (several are GPL); running them from a
+script does not make this project GPL. See
+[THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) for the full attribution
+list and a thank-you to the f3 project, which does the actual fake-capacity
+detection.
+
+**No warranty.** These scripts run `mkfs.ext4 -F`, `f3probe --destructive` and
+raw `fio` writes against whatever block device you point them at. They will
+destroy all data on the target. Check the device path twice. You run them at
+your own risk.
+
+SanDisk, Kingston, Samsung and other brands named in this documentation are
+trademarks of their respective owners, referenced only as examples of commonly
+counterfeited products. No affiliation or endorsement is implied.
+
